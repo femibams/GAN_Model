@@ -1,0 +1,11 @@
+torch
+torchvision
+torchmetrics
+torch-fidelity
+open-clip-torch
+kaggle
+pandas
+numpy
+matplotlib
+Pillow
+tqdm

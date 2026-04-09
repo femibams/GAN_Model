@@ -1,0 +1,168 @@
+import os
+import torch
+import pandas as pd
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import config
+
+
+def attrs_to_prompt(attr_row):
+    tokens = ["a portrait photo of a person"]
+
+    if attr_row.get("Smiling", -1) > 0:
+        tokens.append("smiling")
+    if attr_row.get("Young", -1) > 0:
+        tokens.append("young")
+    if attr_row.get("Male", -1) > 0:
+        tokens.append("male")
+
+    hair_tokens = []
+    if attr_row.get("Black_Hair", -1) > 0:
+        hair_tokens.append("black hair")
+    if attr_row.get("Blond_Hair", -1) > 0:
+        hair_tokens.append("blond hair")
+    if attr_row.get("Brown_Hair", -1) > 0:
+        hair_tokens.append("brown hair")
+    if attr_row.get("Gray_Hair", -1) > 0:
+        hair_tokens.append("gray hair")
+    if attr_row.get("Bald", -1) > 0:
+        hair_tokens.append("bald")
+    if hair_tokens:
+        tokens.extend(hair_tokens[:1])
+
+    if attr_row.get("Eyeglasses", -1) > 0:
+        tokens.append("wearing eyeglasses")
+    if attr_row.get("Mustache", -1) > 0:
+        tokens.append("with mustache")
+    if attr_row.get("Wearing_Hat", -1) > 0:
+        tokens.append("wearing a hat")
+
+    return ", ".join(tokens)
+
+
+class CelebADataset(Dataset):
+    def __init__(self, img_dir, bbox_file, attr_file=None, transform=None, return_prompt=False,
+                 clip_embeddings=None):
+        self.img_dir = img_dir
+        self.return_prompt = bool(return_prompt)
+        # Reading via pandas is fine, but avoid per-sample iloc overhead by
+        # materializing the needed columns as arrays once.
+        df = pd.read_csv(bbox_file)
+
+        if self.return_prompt and attr_file and os.path.exists(attr_file):
+            attrs_df = pd.read_csv(attr_file)
+            merged = df.merge(attrs_df, on="image_id", how="left")
+            self.prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).to_numpy()
+        else:
+            self.prompts = None
+
+        # Pre-computed CLIP embeddings [N, EMBEDDING_SIZE] on CPU — avoids CLIP
+        # inference inside the training loop (which adds ~50-100ms per batch).
+        self.clip_embeddings = clip_embeddings  # may be None
+
+        self.image_ids = df["image_id"].astype(str).to_numpy()
+        self.bboxes_xywh = df[["x_1", "y_1", "width", "height"]].to_numpy()
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        img_name = self.image_ids[idx]
+        img_path = os.path.join(self.img_dir, img_name)
+
+        image = Image.open(img_path).convert("RGB")
+
+        # bbox format: x, y, width, height
+        x, y, w, h = self.bboxes_xywh[idx]
+
+        # Convert to normalized [x1, y1, x2, y2]
+        W, H = image.size
+        x1 = x / W
+        y1 = y / H
+        x2 = (x + w) / W
+        y2 = (y + h) / H
+
+        bbox = torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+
+        if self.transform:
+            image = self.transform(image)
+
+        if self.return_prompt:
+            if self.clip_embeddings is not None:
+                # Return the pre-computed embedding directly (a CPU tensor)
+                text_input = self.clip_embeddings[idx]
+            elif self.prompts is not None:
+                text_input = self.prompts[idx]
+            else:
+                text_input = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
+        else:
+            text_input = torch.zeros(config.EMBEDDING_SIZE, dtype=torch.float32)
+
+        return image, text_input, bbox
+
+
+def precompute_clip_embeddings(clip_model, tokenizer, attr_file, bbox_file, device,
+                               embedding_size, cache_path="outputs/clip_embeddings.pt"):
+    """Encode all prompts once and cache to disk. Returns a CPU float32 tensor [N, D]."""
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    if os.path.exists(cache_path):
+        print(f"Loading cached CLIP embeddings from {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
+    print("Pre-computing CLIP embeddings for the full dataset (one-time cost)...")
+    df = pd.read_csv(bbox_file)
+    if attr_file and os.path.exists(attr_file):
+        attrs_df = pd.read_csv(attr_file)
+        merged = df.merge(attrs_df, on="image_id", how="left")
+        prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).tolist()
+    else:
+        default = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
+        prompts = [default] * len(df)
+
+    batch_size = 512
+    all_embeddings = []
+    clip_model.eval()
+    with torch.no_grad():
+        for start in range(0, len(prompts), batch_size):
+            batch = prompts[start:start + batch_size]
+            tokens = tokenizer(batch).to(device)
+            emb = clip_model.encode_text(tokens).float().cpu()
+            all_embeddings.append(emb)
+            if start % 10000 == 0:
+                print(f"  {start}/{len(prompts)}")
+
+    embeddings = torch.cat(all_embeddings, dim=0)
+    torch.save(embeddings, cache_path)
+    print(f"Saved CLIP embeddings to {cache_path} — shape {tuple(embeddings.shape)}")
+    return embeddings
+
+
+def get_dataloader(return_prompt=False, batch_size=None, shuffle=True, clip_embeddings=None):
+    transform = transforms.Compose([
+        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5]*3, [0.5]*3)
+    ])
+
+    dataset = CelebADataset(
+        img_dir=config.IMG_DIR,
+        bbox_file=config.BBOX_FILE,
+        attr_file=getattr(config, "ATTR_FILE", None),
+        transform=transform,
+        return_prompt=return_prompt,
+        clip_embeddings=clip_embeddings,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=(batch_size if batch_size is not None else config.BATCH_SIZE),
+        shuffle=shuffle,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=bool(getattr(config, "PERSISTENT_WORKERS", False)) if config.NUM_WORKERS > 0 else False,
+        prefetch_factor=int(getattr(config, "PREFETCH_FACTOR", 2)) if config.NUM_WORKERS > 0 else None,
+    )
+
+    return dataloader
