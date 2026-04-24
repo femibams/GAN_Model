@@ -64,15 +64,16 @@ def verify(img_dir: str, json_file: str) -> None:
             print(f"  WARN: key '{key}' missing from JSON")
             continue
         subdir = f"{(iid // 1000) * 1000:05d}"
-        path = os.path.join(img_dir, subdir, f"img{iid:08d}.png")
+        path = os.path.join(img_dir, subdir, f"{iid:05d}.png")
         exists = os.path.exists(path)
         status = "OK" if exists else "MISSING"
         print(f"  Sample [{iid:05d}] {path} — {status}")
 
-    # Quick bbox sanity-check on first entry
+    # Quick bbox sanity-check on first entry (derived from face landmarks)
     first_val = meta[str(sample_ids[0])]
-    rect = first_val.get("facial_components", {}).get("face_rect")
-    print(f"  face_rect[0]  : {rect}  (should be [x, y, w, h] in 1024-px space)")
+    landmarks = first_val["image"]["face_landmarks"]
+    xs = [p[0] for p in landmarks]; ys = [p[1] for p in landmarks]
+    print(f"  landmarks[0]  : {len(landmarks)} points → bbox ({min(xs):.0f},{min(ys):.0f})->({max(xs):.0f},{max(ys):.0f}) in 1024-px space")
 
     print("\nVerification complete. If no ERRORs above, you're ready to train with DATASET='ffhq'.")
 

@@ -111,11 +111,12 @@ class FFHQDataset(Dataset):
       img_dir   — path to thumbnails128x128/ (contains subdirs 00000/, 01000/, …)
       json_file — path to ffhq-dataset-v2.json
 
-    Each JSON entry has facial_components.face_rect = [x, y, w, h] in 1024×1024 pixel
-    space regardless of which image size is used, so we normalise by 1024.
+    Bounding boxes are derived from the 68 face landmarks stored under
+    image.face_landmarks (already in 1024×1024 space), then normalised to [0, 1].
+    Image paths follow the JSON thumbnail.file_path convention: {subdir}/{id:05d}.png
     """
 
-    _BBOX_ORIGIN = 1024  # JSON bbox coords are always in 1024×1024 space
+    _BBOX_ORIGIN = 1024  # landmarks are always in 1024×1024 space
 
     def __init__(self, img_dir, json_file, transform=None, clip_embeddings=None):
         self.img_dir = img_dir
@@ -129,12 +130,14 @@ class FFHQDataset(Dataset):
         entries = sorted(meta.items(), key=lambda kv: int(kv[0]))
 
         self.image_ids = []
-        self.bboxes_xywh = []  # raw pixel coords in 1024 space
+        self.bboxes_xyxy = []  # (x1, y1, x2, y2) in 1024-px space, derived from landmarks
         for key, val in entries:
             iid = int(key)
-            rect = val.get("facial_components", {}).get("face_rect", [256, 256, 512, 512])
+            landmarks = val["image"]["face_landmarks"]  # list of [x, y] pairs
+            xs = [p[0] for p in landmarks]
+            ys = [p[1] for p in landmarks]
             self.image_ids.append(iid)
-            self.bboxes_xywh.append(rect)
+            self.bboxes_xyxy.append((min(xs), min(ys), max(xs), max(ys)))
 
     def __len__(self):
         return len(self.image_ids)
@@ -142,12 +145,12 @@ class FFHQDataset(Dataset):
     def __getitem__(self, idx):
         iid = self.image_ids[idx]
         subdir = f"{(iid // 1000) * 1000:05d}"
-        img_path = os.path.join(self.img_dir, subdir, f"img{iid:08d}.png")
+        img_path = os.path.join(self.img_dir, subdir, f"{iid:05d}.png")
         image = Image.open(img_path).convert("RGB")
 
-        x, y, w, h = self.bboxes_xywh[idx]
+        x1, y1, x2, y2 = self.bboxes_xyxy[idx]
         o = self._BBOX_ORIGIN
-        bbox = torch.tensor([x / o, y / o, (x + w) / o, (y + h) / o], dtype=torch.float32)
+        bbox = torch.tensor([x1 / o, y1 / o, x2 / o, y2 / o], dtype=torch.float32)
         bbox.clamp_(0.0, 1.0)
 
         if self.transform:
