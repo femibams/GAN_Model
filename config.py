@@ -22,7 +22,7 @@ LAMBDA_ROI = 1.0
 LAMBDA_LEAK = 0.01          # was 0.05; leakage was over-constraining the generator
 USE_BACKGROUND_LEAK = True  # use real-image background as reference instead of zeroing
 LR = 5e-4                   # 2e-3 caused NaN; lower is safer for new architecture
-LR_D = 2e-4                 # discriminator is more sensitive — keep lower than G
+LR_D = 5e-4                 # match G LR — D must keep pace with G to provide clean gradients
 BETAS = (0.0, 0.99)         # was (0.5, 0.999); StyleGAN2 standard — β1=0 kills momentum
 
 # R1 gradient penalty (prevents discriminator from dominating)
@@ -37,7 +37,7 @@ PL_INTERVAL = 4    # lazy: compute every N generator steps
 # Adaptive Data Augmentation (ADA) — adapts augmentation strength automatically
 ADA_TARGET   = 0.6    # target mean(sign(D(real))); 0.6 ≈ D correct ~80% of the time
 ADA_INTERVAL = 4      # steps between p updates
-ADA_KIMG     = 500.0  # adjustment speed in k-images; higher = slower ramp
+ADA_KIMG     = 200.0  # adjustment speed in k-images; lower = faster ramp
 
 # Generator EMA — smoothed weights used for all visualisation and evaluation
 EMA_KIMG = 10.0        # smoothing window in k-images (StyleGAN2 default)
@@ -47,7 +47,7 @@ ROI_WARMUP_START = 10
 ROI_WARMUP_END = 30
 
 # LR decay: linear decay from LR_DECAY_START epoch to 0 at NUM_EPOCHS
-LR_DECAY_START = 100        # was 150; start decay earlier so final epochs fine-tune
+LR_DECAY_START = 200        # decay in final third only — model needs full LR for most of training
 
 # Perf
 USE_AMP = True  # mixed precision on CUDA

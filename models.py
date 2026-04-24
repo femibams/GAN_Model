@@ -79,11 +79,17 @@ class MinibatchStdDev(nn.Module):
 # ---------------------------------------------------------------------------
 # Anti-aliased blur upsampling
 # ---------------------------------------------------------------------------
+_BLUR_KERNEL_CACHE: dict = {}
+
+
 def _blur_kernel(channels: int, device, dtype) -> torch.Tensor:
-    k = torch.tensor([1.0, 2.0, 1.0], device=device, dtype=dtype)
-    k = k[:, None] * k[None, :]
-    k = k / k.sum()
-    return k.unsqueeze(0).unsqueeze(0).expand(channels, 1, 3, 3)
+    key = (channels, device, dtype)
+    if key not in _BLUR_KERNEL_CACHE:
+        k = torch.tensor([1.0, 2.0, 1.0], device=device, dtype=dtype)
+        k = k[:, None] * k[None, :]
+        k = k / k.sum()
+        _BLUR_KERNEL_CACHE[key] = k.unsqueeze(0).unsqueeze(0).expand(channels, 1, 3, 3).contiguous()
+    return _BLUR_KERNEL_CACHE[key]
 
 
 def blur_upsample(x: torch.Tensor) -> torch.Tensor:
