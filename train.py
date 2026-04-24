@@ -289,14 +289,29 @@ def main():
     # This eliminates per-batch CLIP inference in the training loop.
     clip_embeddings = None
     if clip_model is not None:
-        clip_embeddings = precompute_clip_embeddings(
-            clip_model=clip_model,
-            tokenizer=clip_tokenizer,
-            attr_file=getattr(config, "ATTR_FILE", None),
-            bbox_file=config.BBOX_FILE,
-            device=config.DEVICE,
-            embedding_size=config.EMBEDDING_SIZE,
-        )
+        dataset_name = getattr(config, "DATASET", "celeba").lower()
+        if dataset_name == "ffhq":
+            # FFHQ has no per-image attribute labels; use one shared prompt for all entries.
+            import json
+            with open(config.FFHQ_JSON_FILE) as _f:
+                _n = len(json.load(_f))
+            _default = getattr(config, "DEFAULT_PROMPT", "a high-quality portrait photo of a person")
+            clip_embeddings = precompute_clip_embeddings(
+                clip_model=clip_model,
+                tokenizer=clip_tokenizer,
+                device=config.DEVICE,
+                embedding_size=config.EMBEDDING_SIZE,
+                prompts=[_default] * _n,
+            )
+        else:
+            clip_embeddings = precompute_clip_embeddings(
+                clip_model=clip_model,
+                tokenizer=clip_tokenizer,
+                device=config.DEVICE,
+                embedding_size=config.EMBEDDING_SIZE,
+                attr_file=getattr(config, "ATTR_FILE", None),
+                bbox_file=config.BBOX_FILE,
+            )
 
     dataloader = get_dataloader(return_prompt=True, clip_embeddings=clip_embeddings)
 

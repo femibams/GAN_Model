@@ -1,3 +1,4 @@
+import json
 import os
 import torch
 import pandas as pd
@@ -103,23 +104,86 @@ class CelebADataset(Dataset):
         return image, text_input, bbox
 
 
-def precompute_clip_embeddings(clip_model, tokenizer, attr_file, bbox_file, device,
-                               embedding_size, cache_path="outputs/clip_embeddings.pt"):
-    """Encode all prompts once and cache to disk. Returns a CPU float32 tensor [N, D]."""
+class FFHQDataset(Dataset):
+    """FFHQ thumbnails128x128 dataset.
+
+    Expects:
+      img_dir   — path to thumbnails128x128/ (contains subdirs 00000/, 01000/, …)
+      json_file — path to ffhq-dataset-v2.json
+
+    Each JSON entry has facial_components.face_rect = [x, y, w, h] in 1024×1024 pixel
+    space regardless of which image size is used, so we normalise by 1024.
+    """
+
+    _BBOX_ORIGIN = 1024  # JSON bbox coords are always in 1024×1024 space
+
+    def __init__(self, img_dir, json_file, transform=None, clip_embeddings=None):
+        self.img_dir = img_dir
+        self.transform = transform
+        self.clip_embeddings = clip_embeddings
+
+        with open(json_file) as f:
+            meta = json.load(f)
+
+        # Sort by integer key so index order is deterministic
+        entries = sorted(meta.items(), key=lambda kv: int(kv[0]))
+
+        self.image_ids = []
+        self.bboxes_xywh = []  # raw pixel coords in 1024 space
+        for key, val in entries:
+            iid = int(key)
+            rect = val.get("facial_components", {}).get("face_rect", [256, 256, 512, 512])
+            self.image_ids.append(iid)
+            self.bboxes_xywh.append(rect)
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        iid = self.image_ids[idx]
+        subdir = f"{(iid // 1000) * 1000:05d}"
+        img_path = os.path.join(self.img_dir, subdir, f"img{iid:08d}.png")
+        image = Image.open(img_path).convert("RGB")
+
+        x, y, w, h = self.bboxes_xywh[idx]
+        o = self._BBOX_ORIGIN
+        bbox = torch.tensor([x / o, y / o, (x + w) / o, (y + h) / o], dtype=torch.float32)
+        bbox.clamp_(0.0, 1.0)
+
+        if self.transform:
+            image = self.transform(image)
+
+        if self.clip_embeddings is not None:
+            text_input = self.clip_embeddings[idx]
+        else:
+            text_input = getattr(config, "DEFAULT_PROMPT", "a high-quality portrait photo of a person")
+
+        return image, text_input, bbox
+
+
+def precompute_clip_embeddings(clip_model, tokenizer, device,
+                               embedding_size, cache_path="outputs/clip_embeddings.pt",
+                               attr_file=None, bbox_file=None, prompts=None):
+    """Encode all prompts once and cache to disk. Returns a CPU float32 tensor [N, D].
+
+    Callers may either pass a ready-made ``prompts`` list, or supply ``attr_file`` /
+    ``bbox_file`` for CelebA-style attribute-derived prompts.
+    """
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
     if os.path.exists(cache_path):
         print(f"Loading cached CLIP embeddings from {cache_path}")
         return torch.load(cache_path, map_location="cpu")
 
     print("Pre-computing CLIP embeddings for the full dataset (one-time cost)...")
-    df = pd.read_csv(bbox_file)
-    if attr_file and os.path.exists(attr_file):
-        attrs_df = pd.read_csv(attr_file)
-        merged = df.merge(attrs_df, on="image_id", how="left")
-        prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).tolist()
-    else:
-        default = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
-        prompts = [default] * len(df)
+    if prompts is None:
+        df = pd.read_csv(bbox_file)
+        if attr_file and os.path.exists(attr_file):
+            attrs_df = pd.read_csv(attr_file)
+            merged = df.merge(attrs_df, on="image_id", how="left")
+            prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).tolist()
+        else:
+            default = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
+            prompts = [default] * len(df)
 
     batch_size = 512
     all_embeddings = []
@@ -146,14 +210,23 @@ def get_dataloader(return_prompt=False, batch_size=None, shuffle=True, clip_embe
         transforms.Normalize([0.5]*3, [0.5]*3)
     ])
 
-    dataset = CelebADataset(
-        img_dir=config.IMG_DIR,
-        bbox_file=config.BBOX_FILE,
-        attr_file=getattr(config, "ATTR_FILE", None),
-        transform=transform,
-        return_prompt=return_prompt,
-        clip_embeddings=clip_embeddings,
-    )
+    dataset_name = getattr(config, "DATASET", "celeba").lower()
+    if dataset_name == "ffhq":
+        dataset = FFHQDataset(
+            img_dir=config.FFHQ_IMG_DIR,
+            json_file=config.FFHQ_JSON_FILE,
+            transform=transform,
+            clip_embeddings=clip_embeddings,
+        )
+    else:
+        dataset = CelebADataset(
+            img_dir=config.IMG_DIR,
+            bbox_file=config.BBOX_FILE,
+            attr_file=getattr(config, "ATTR_FILE", None),
+            transform=transform,
+            return_prompt=return_prompt,
+            clip_embeddings=clip_embeddings,
+        )
 
     dataloader = DataLoader(
         dataset,

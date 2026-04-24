@@ -1,9 +1,17 @@
 import torch
 
-# Paths
+# Dataset selection: "celeba" or "ffhq"
+DATASET = "ffhq"
+
+# CelebA paths
 IMG_DIR = "data/img_align_celeba/img_align_celeba"
 BBOX_FILE = "data/list_bbox_celeba.csv"
 ATTR_FILE = "data/list_attr_celeba.csv"
+
+# FFHQ paths (thumbnails128x128 matches IMAGE_SIZE=128 directly)
+FFHQ_IMG_DIR = "data/ffhq/thumbnails128x128"
+FFHQ_JSON_FILE = "data/ffhq/ffhq-dataset-v2.json"
+
 RESULT_FILE = "outputs/training_results.csv"
 
 # Hyperparameters
