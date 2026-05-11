@@ -28,7 +28,8 @@ models.py        Generator + Discriminator (StyleGAN2 building blocks)
 dataset.py       FFHQDataset: scans a folder, hflip + crop-jitter
 utils.py         losses, R1 / path-length penalties, image-grid saver
 train.py         iteration-based training loop with AMP / R1 / PL / EMA / resume
-infer.py         load a checkpoint and dump a grid of samples
+infer.py         load a checkpoint and generate a single face from random noise
+infer_prompt.py  prompt-guided generation via CLIP-guided latent optimization
 prepare_ffhq.py  verify the FFHQ folder is set up
 ```
 
@@ -106,17 +107,51 @@ The checkpoint stores the architecture config it was trained with, so
 `infer.py` rebuilds the correct generator regardless of the current
 `config.py` values.
 
-## 4. Inference — generate sample faces
+## 4. Inference — generate a sample face
 
 ```bash
-python infer.py                      # 64-image grid, EMA G, truncation 0.7
-python infer.py --num-samples 16 --nrow 4 --truncation 0.5
+python infer.py                                                  # one face, EMA G, truncation 0.7, random seed
+python infer.py --seed 42 --truncation 0.5                       # reproducible run
 python infer.py --ckpt outputs/checkpoints/step_0050000.pth --out preview.png
 ```
 
-Output is written as a single PNG grid.  Truncation `< 1.0` blends each `w`
-toward the average `w` (computed from 10k random `z`'s), trading diversity
-for fidelity — `~0.5–0.7` is a good range for face GANs.
+Each run prints the seed it used (e.g. `Seed: 16962057276122653174`) so a
+result you like can be reproduced with `--seed <that number>`. Truncation
+`< 1.0` blends `w` toward the average `w` (computed from 10k random `z`'s),
+trading diversity for fidelity — `~0.5–0.7` is a good range for face GANs.
+
+## 5. Prompt-guided inference (CLIP-steered)
+
+The trained generator is **unconditional** — it has no text input. To bias
+generation toward a prompt, `infer_prompt.py` keeps G frozen and optimizes a
+single style vector `w` so the generated image's CLIP embedding matches the
+prompt's CLIP embedding (a StyleCLIP-style latent optimization).
+
+```bash
+pip install open_clip_torch
+python infer_prompt.py --prompt "a smiling woman with red hair"
+python infer_prompt.py --prompt "an elderly man with a beard" --steps 400 --lr 0.1
+```
+
+Quality is bounded by what G already learned: prompts inside the face
+distribution (hair, age, expression, lighting) work; out-of-distribution
+prompts ("astronaut on Mars") will not.
+
+Key knobs:
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--prompt` | (required) | text prompt to steer generation |
+| `--steps` | 200 | optimization steps |
+| `--lr` | 0.05 | Adam learning rate for `w` |
+| `--truncation` | 0.7 | initial truncation psi for `w` |
+| `--w-reg` | 0.05 | L2 pull toward `w_avg` (prevents off-manifold drift) |
+| `--clip-model` | `ViT-B-16` | `open_clip` model name |
+| `--clip-pretrained` | `openai` | `open_clip` pretrained tag |
+
+If results look "averaged" or boring, drop `--w-reg` and raise
+`--truncation`. If the image drifts off-manifold (weird artifacts), do the
+opposite.
 
 ## Notes on quality vs. compute
 

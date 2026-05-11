@@ -4,3 +4,5 @@ Pillow
 numpy
 # Optional — only needed if you want to compute FID externally
 # torch-fidelity
+# Required for prompt-guided inference (infer_prompt.py)
+open_clip_torch
