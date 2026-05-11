@@ -1,244 +1,128 @@
-import json
+"""FFHQ data pipeline.
+
+Scans a directory for image files (recursively, so both flat
+`thumbnails128x128/00000.png` and bucketed `thumbnails128x128/00000/00000.png`
+layouts work) and yields tensors normalised to [-1, 1].
+
+Augmentations applied to every sample:
+  - random horizontal flip (50%)
+  - resize to int(img_size * (1 + jitter)) then random crop to img_size
+
+The crop jitter is small (default 0.05) so the pre-aligned faces are not
+substantially decentred.
+"""
 import os
+import glob
+import random
+from typing import List, Optional
+
 import torch
-import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+
 import config
 
 
-def attrs_to_prompt(attr_row):
-    tokens = ["a portrait photo of a person"]
+def _pil_to_normalized_tensor(img: Image.Image) -> torch.Tensor:
+    """PIL RGB -> float tensor in [-1, 1] without going through numpy.
 
-    if attr_row.get("Smiling", -1) > 0:
-        tokens.append("smiling")
-    if attr_row.get("Young", -1) > 0:
-        tokens.append("young")
-    if attr_row.get("Male", -1) > 0:
-        tokens.append("male")
-
-    hair_tokens = []
-    if attr_row.get("Black_Hair", -1) > 0:
-        hair_tokens.append("black hair")
-    if attr_row.get("Blond_Hair", -1) > 0:
-        hair_tokens.append("blond hair")
-    if attr_row.get("Brown_Hair", -1) > 0:
-        hair_tokens.append("brown hair")
-    if attr_row.get("Gray_Hair", -1) > 0:
-        hair_tokens.append("gray hair")
-    if attr_row.get("Bald", -1) > 0:
-        hair_tokens.append("bald")
-    if hair_tokens:
-        tokens.extend(hair_tokens[:1])
-
-    if attr_row.get("Eyeglasses", -1) > 0:
-        tokens.append("wearing eyeglasses")
-    if attr_row.get("Mustache", -1) > 0:
-        tokens.append("with mustache")
-    if attr_row.get("Wearing_Hat", -1) > 0:
-        tokens.append("wearing a hat")
-
-    return ", ".join(tokens)
+    torchvision.ToTensor uses np.array internally and breaks in environments
+    with broken numpy installs.  We convert via the raw byte buffer instead.
+    """
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = bytearray(img.tobytes())
+    t = torch.frombuffer(buf, dtype=torch.uint8)
+    t = t.view(img.height, img.width, 3).permute(2, 0, 1).contiguous().float()
+    t = t.div_(255.0).sub_(0.5).mul_(2.0)
+    return t
 
 
-class CelebADataset(Dataset):
-    def __init__(self, img_dir, bbox_file, attr_file=None, transform=None, return_prompt=False,
-                 clip_embeddings=None):
-        self.img_dir = img_dir
-        self.return_prompt = bool(return_prompt)
-        # Reading via pandas is fine, but avoid per-sample iloc overhead by
-        # materializing the needed columns as arrays once.
-        df = pd.read_csv(bbox_file)
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
-        if self.return_prompt and attr_file and os.path.exists(attr_file):
-            attrs_df = pd.read_csv(attr_file)
-            merged = df.merge(attrs_df, on="image_id", how="left")
-            self.prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).to_numpy()
-        else:
-            self.prompts = None
 
-        # Pre-computed CLIP embeddings [N, EMBEDDING_SIZE] on CPU — avoids CLIP
-        # inference inside the training loop (which adds ~50-100ms per batch).
-        self.clip_embeddings = clip_embeddings  # may be None
-
-        self.image_ids = df["image_id"].astype(str).to_numpy()
-        self.bboxes_xywh = df[["x_1", "y_1", "width", "height"]].to_numpy()
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        img_name = self.image_ids[idx]
-        img_path = os.path.join(self.img_dir, img_name)
-
-        image = Image.open(img_path).convert("RGB")
-
-        # bbox format: x, y, width, height
-        x, y, w, h = self.bboxes_xywh[idx]
-
-        # Convert to normalized [x1, y1, x2, y2]
-        W, H = image.size
-        x1 = x / W
-        y1 = y / H
-        x2 = (x + w) / W
-        y2 = (y + h) / H
-
-        bbox = torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
-
-        if self.transform:
-            image = self.transform(image)
-
-        if self.return_prompt:
-            if self.clip_embeddings is not None:
-                # Return the pre-computed embedding directly (a CPU tensor)
-                text_input = self.clip_embeddings[idx]
-            elif self.prompts is not None:
-                text_input = self.prompts[idx]
-            else:
-                text_input = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
-        else:
-            text_input = torch.zeros(config.EMBEDDING_SIZE, dtype=torch.float32)
-
-        return image, text_input, bbox
+def _scan_images(root: str) -> List[str]:
+    """Recursively find image files under root, sorted for determinism."""
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"Image directory not found: {root}")
+    paths: List[str] = []
+    for ext in _IMG_EXTS:
+        paths.extend(glob.glob(os.path.join(root, f"*{ext}")))
+        paths.extend(glob.glob(os.path.join(root, "**", f"*{ext}"), recursive=True))
+    paths = sorted(set(paths))
+    if not paths:
+        raise RuntimeError(f"No images found under {root}")
+    return paths
 
 
 class FFHQDataset(Dataset):
-    """FFHQ thumbnails128x128 dataset.
+    def __init__(self, img_dir: str, img_size: int,
+                 hflip: bool = True, crop_jitter: float = 0.05,
+                 max_images: Optional[int] = None):
+        self.paths = _scan_images(img_dir)
+        if max_images is not None and max_images > 0:
+            self.paths = self.paths[:max_images]
+        self.img_size = img_size
+        self.hflip = bool(hflip)
+        self.crop_jitter = float(crop_jitter)
 
-    Expects:
-      img_dir   — path to thumbnails128x128/ (contains subdirs 00000/, 01000/, …)
-      json_file — path to ffhq-dataset-v2.json
-
-    Bounding boxes are derived from the 68 face landmarks stored under
-    image.face_landmarks (already in 1024×1024 space), then normalised to [0, 1].
-    Image paths follow the JSON thumbnail.file_path convention: {subdir}/{id:05d}.png
-    """
-
-    _BBOX_ORIGIN = 1024  # landmarks are always in 1024×1024 space
-
-    def __init__(self, img_dir, json_file, transform=None, clip_embeddings=None):
-        self.img_dir = img_dir
-        self.transform = transform
-        self.clip_embeddings = clip_embeddings
-
-        with open(json_file) as f:
-            meta = json.load(f)
-
-        # Sort by integer key so index order is deterministic
-        entries = sorted(meta.items(), key=lambda kv: int(kv[0]))
-
-        self.image_ids = []
-        self.bboxes_xyxy = []  # (x1, y1, x2, y2) in 1024-px space, derived from landmarks
-        for key, val in entries:
-            iid = int(key)
-            landmarks = val["image"]["face_landmarks"]  # list of [x, y] pairs
-            xs = [p[0] for p in landmarks]
-            ys = [p[1] for p in landmarks]
-            self.image_ids.append(iid)
-            self.bboxes_xyxy.append((min(xs), min(ys), max(xs), max(ys)))
+        # Resize size used before random crop
+        self._resize_size = int(round(img_size * (1.0 + max(crop_jitter, 0.0))))
 
     def __len__(self):
-        return len(self.image_ids)
+        return len(self.paths)
 
     def __getitem__(self, idx):
-        iid = self.image_ids[idx]
-        subdir = f"{(iid // 1000) * 1000:05d}"
-        img_path = os.path.join(self.img_dir, subdir, f"{iid:05d}.png")
-        image = Image.open(img_path).convert("RGB")
-
-        x1, y1, x2, y2 = self.bboxes_xyxy[idx]
-        o = self._BBOX_ORIGIN
-        bbox = torch.tensor([x1 / o, y1 / o, x2 / o, y2 / o], dtype=torch.float32)
-        bbox.clamp_(0.0, 1.0)
-
-        if self.transform:
-            image = self.transform(image)
-
-        if self.clip_embeddings is not None:
-            text_input = self.clip_embeddings[idx]
+        img = Image.open(self.paths[idx]).convert("RGB")
+        # Resize-with-jitter then random-crop, or plain resize when jitter=0
+        if self._resize_size != self.img_size:
+            img = TF.resize(img, [self._resize_size, self._resize_size],
+                            interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
+            max_off = self._resize_size - self.img_size
+            top = random.randint(0, max_off)
+            left = random.randint(0, max_off)
+            img = TF.crop(img, top, left, self.img_size, self.img_size)
         else:
-            text_input = getattr(config, "DEFAULT_PROMPT", "a high-quality portrait photo of a person")
+            img = TF.resize(img, [self.img_size, self.img_size],
+                            interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
 
-        return image, text_input, bbox
+        if self.hflip and random.random() < 0.5:
+            img = TF.hflip(img)
 
-
-def precompute_clip_embeddings(clip_model, tokenizer, device,
-                               embedding_size, cache_path="outputs/clip_embeddings.pt",
-                               attr_file=None, bbox_file=None, prompts=None):
-    """Encode all prompts once and cache to disk. Returns a CPU float32 tensor [N, D].
-
-    Callers may either pass a ready-made ``prompts`` list, or supply ``attr_file`` /
-    ``bbox_file`` for CelebA-style attribute-derived prompts.
-    """
-    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-    if os.path.exists(cache_path):
-        print(f"Loading cached CLIP embeddings from {cache_path}")
-        return torch.load(cache_path, map_location="cpu")
-
-    print("Pre-computing CLIP embeddings for the full dataset (one-time cost)...")
-    if prompts is None:
-        df = pd.read_csv(bbox_file)
-        if attr_file and os.path.exists(attr_file):
-            attrs_df = pd.read_csv(attr_file)
-            merged = df.merge(attrs_df, on="image_id", how="left")
-            prompts = merged.apply(attrs_to_prompt, axis=1).astype(str).tolist()
-        else:
-            default = getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")
-            prompts = [default] * len(df)
-
-    batch_size = 512
-    all_embeddings = []
-    clip_model.eval()
-    with torch.no_grad():
-        for start in range(0, len(prompts), batch_size):
-            batch = prompts[start:start + batch_size]
-            tokens = tokenizer(batch).to(device)
-            emb = clip_model.encode_text(tokens).float().cpu()
-            all_embeddings.append(emb)
-            if start % 10000 == 0:
-                print(f"  {start}/{len(prompts)}")
-
-    embeddings = torch.cat(all_embeddings, dim=0)
-    torch.save(embeddings, cache_path)
-    print(f"Saved CLIP embeddings to {cache_path} — shape {tuple(embeddings.shape)}")
-    return embeddings
+        return _pil_to_normalized_tensor(img)
 
 
-def get_dataloader(return_prompt=False, batch_size=None, shuffle=True, clip_embeddings=None):
-    transform = transforms.Compose([
-        transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3)
-    ])
+def get_dataloader(batch_size: Optional[int] = None, shuffle: bool = True,
+                   max_images: Optional[int] = None):
+    dataset = FFHQDataset(
+        img_dir=config.FFHQ_IMG_DIR,
+        img_size=config.IMAGE_SIZE,
+        hflip=getattr(config, "AUG_HFLIP", True),
+        crop_jitter=getattr(config, "AUG_CROP_JITTER", 0.05),
+        max_images=max_images if max_images is not None
+                    else getattr(config, "MAX_IMAGES", None),
+    )
+    print(f"Dataset: {len(dataset)} images @ {dataset.img_size}x{dataset.img_size}")
 
-    dataset_name = getattr(config, "DATASET", "celeba").lower()
-    if dataset_name == "ffhq":
-        dataset = FFHQDataset(
-            img_dir=config.FFHQ_IMG_DIR,
-            json_file=config.FFHQ_JSON_FILE,
-            transform=transform,
-            clip_embeddings=clip_embeddings,
-        )
-    else:
-        dataset = CelebADataset(
-            img_dir=config.IMG_DIR,
-            bbox_file=config.BBOX_FILE,
-            attr_file=getattr(config, "ATTR_FILE", None),
-            transform=transform,
-            return_prompt=return_prompt,
-            clip_embeddings=clip_embeddings,
-        )
-
-    dataloader = DataLoader(
-        dataset,
+    nw = config.NUM_WORKERS
+    kwargs = dict(
+        dataset=dataset,
         batch_size=(batch_size if batch_size is not None else config.BATCH_SIZE),
         shuffle=shuffle,
-        num_workers=config.NUM_WORKERS,
+        num_workers=nw,
         pin_memory=True,
-        persistent_workers=bool(getattr(config, "PERSISTENT_WORKERS", False)) if config.NUM_WORKERS > 0 else False,
-        prefetch_factor=int(getattr(config, "PREFETCH_FACTOR", 2)) if config.NUM_WORKERS > 0 else None,
+        drop_last=True,
     )
+    # PyTorch 1.12 rejects persistent_workers / prefetch_factor when num_workers == 0
+    if nw > 0:
+        kwargs["persistent_workers"] = bool(getattr(config, "PERSISTENT_WORKERS", False))
+        kwargs["prefetch_factor"] = int(getattr(config, "PREFETCH_FACTOR", 2))
+    return DataLoader(**kwargs)
 
-    return dataloader
+
+def infinite_loader(loader: DataLoader):
+    """Yield batches forever, re-iterating the loader each epoch."""
+    while True:
+        for batch in loader:
+            yield batch

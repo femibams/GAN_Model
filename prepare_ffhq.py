@@ -1,83 +1,55 @@
-"""
-One-time setup script for the FFHQ dataset.
+"""One-time setup helper for the FFHQ dataset.
 
-Downloads the FFHQ thumbnails128x128 (2.2 GB) and metadata JSON, then
-verifies the directory layout expected by FFHQDataset in dataset.py.
+The training pipeline only needs a folder of face images.  This script verifies
+that ``config.FFHQ_IMG_DIR`` resolves to such a folder and reports how many
+images it contains.
 
-Usage
------
-    python prepare_ffhq.py
+How to obtain FFHQ thumbnails
+-----------------------------
+Method 1 — official downloader (requires accepting NVIDIA's license):
 
-Requirements
-------------
-The FFHQ dataset requires accepting NVIDIA's license before downloading.
-Follow one of the two methods below:
-
-Method 1 — ffhq-dataset tool (official):
-    pip install requests tqdm
     git clone https://github.com/NVlabs/ffhq-dataset.git
     cd ffhq-dataset
-    # Download thumbnails (128×128, ~2.2 GB) + metadata JSON only:
     python download_ffhq.py --thumbnails --json --num_threads 4
-    # Then move / symlink the output into this project:
-    mv thumbnails128x128 ../data/ffhq/thumbnails128x128
-    mv ffhq-dataset-v2.json ../data/ffhq/ffhq-dataset-v2.json
-    cd ..
+    # Move the result so it matches config.FFHQ_IMG_DIR:
+    mkdir -p ../data/ffhq
+    mv thumbnails128x128 ../data/ffhq/
 
-Method 2 — Kaggle (unofficial mirror, no license required):
+Method 2 — Kaggle mirror (no license, ~10k subset also available):
+
     pip install kaggle
     # Place your kaggle.json API token in ~/.kaggle/kaggle.json
-    kaggle datasets download -d greatgamedota/ffhq-face-data-set -p data/ffhq --unzip
-    # Rename the extracted folder so the path matches config.FFHQ_IMG_DIR:
-    mv data/ffhq/thumbnails128x128 data/ffhq/thumbnails128x128   # already correct
+    kaggle datasets download -d greatgamedota/ffhq-face-data-set \
+        -p data/ffhq --unzip
 
-After downloading, run this script to verify the layout:
+Either layout (flat or bucketed under 00000/, 01000/, ...) works because the
+dataset loader scans recursively for *.png/*.jpg files.
+
+Run me to verify
+----------------
     python prepare_ffhq.py
 """
-
-import json
 import os
 import sys
 
+import config
+from dataset import _scan_images
 
-def verify(img_dir: str, json_file: str) -> None:
-    print(f"Checking JSON  : {json_file}")
-    if not os.path.exists(json_file):
-        sys.exit(f"  ERROR: not found. Download ffhq-dataset-v2.json first (see docstring).")
 
-    with open(json_file) as f:
-        meta = json.load(f)
-    print(f"  Entries       : {len(meta):,}")
-
-    print(f"Checking images: {img_dir}")
+def main() -> None:
+    img_dir = config.FFHQ_IMG_DIR
+    print(f"Image dir : {img_dir}")
     if not os.path.isdir(img_dir):
-        sys.exit(f"  ERROR: directory not found. Download thumbnails128x128 first (see docstring).")
+        sys.exit(f"  ERROR: directory not found. See docstring for download instructions.")
 
-    subdirs = sorted(d for d in os.listdir(img_dir) if os.path.isdir(os.path.join(img_dir, d)))
-    print(f"  Subdirs found : {len(subdirs)}  (expected 70, one per 1000 images)")
-
-    # Spot-check first and last entry in the JSON
-    sample_ids = [0, len(meta) - 1]
-    for iid in sample_ids:
-        key = str(iid)
-        if key not in meta:
-            print(f"  WARN: key '{key}' missing from JSON")
-            continue
-        subdir = f"{(iid // 1000) * 1000:05d}"
-        path = os.path.join(img_dir, subdir, f"{iid:05d}.png")
-        exists = os.path.exists(path)
-        status = "OK" if exists else "MISSING"
-        print(f"  Sample [{iid:05d}] {path} — {status}")
-
-    # Quick bbox sanity-check on first entry (derived from face landmarks)
-    first_val = meta[str(sample_ids[0])]
-    landmarks = first_val["image"]["face_landmarks"]
-    xs = [p[0] for p in landmarks]; ys = [p[1] for p in landmarks]
-    print(f"  landmarks[0]  : {len(landmarks)} points → bbox ({min(xs):.0f},{min(ys):.0f})->({max(xs):.0f},{max(ys):.0f}) in 1024-px space")
-
-    print("\nVerification complete. If no ERRORs above, you're ready to train with DATASET='ffhq'.")
+    paths = _scan_images(img_dir)
+    print(f"Images    : {len(paths):,} ({paths[0]} ... {paths[-1]})")
+    if len(paths) < 10_000:
+        print("  WARN: dataset has fewer than 10k images. The model will still train")
+        print("        but quality at 128x128 may suffer; see the README for guidance.")
+    else:
+        print("Looks good — ready to run `python train.py`.")
 
 
 if __name__ == "__main__":
-    import config
-    verify(img_dir=config.FFHQ_IMG_DIR, json_file=config.FFHQ_JSON_FILE)
+    main()

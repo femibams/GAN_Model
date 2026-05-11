@@ -1,559 +1,420 @@
+"""Iteration-based training loop for the small-scale StyleGAN2 face GAN.
+
+Key features
+  - Non-saturating logistic GAN loss (StyleGAN2 default)
+  - R1 gradient penalty on D (lazy, every R1_INTERVAL iterations)
+  - Path-length regularization on G (lazy, every PL_INTERVAL iterations)
+  - Mixed-precision forward passes via torch.amp.autocast + GradScaler
+  - Optional gradient accumulation (GRAD_ACCUM_STEPS in config)
+  - Generator EMA, used for sample grids and saved alongside G
+  - Periodic sample grid saves and checkpoints with full resume support
+"""
+import argparse
 import copy
+import math
 import os
 import time
 
-# Must be set before any CUDA allocation to reduce fragmentation.
-# max_split_size_mb=128 prevents the allocator from holding large cached blocks
-# that can't satisfy subsequent 128 MiB allocation requests.
+# Set before any CUDA allocation to reduce fragmentation under AMP
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
 import torch
 import torch.optim as optim
-from tqdm import tqdm
 
 import config
-from augment import AugmentPipe
-from dataset import get_dataloader, precompute_clip_embeddings
-from models import GeneratorWithMask, GlobalDiscriminator, RoIDiscriminator
+from dataset import get_dataloader, infinite_loader
+from models import Generator, Discriminator
 from utils import (
-    bboxes_to_mask, crop_roi_from_bboxes, d_hinge_loss, g_hinge_loss,
-    leakage_loss_simple, leakage_loss_background, r1_gradient_penalty,
-    path_length_penalty, save_or_show_images
+    d_logistic_loss, g_nonsaturating_loss,
+    r1_gradient_penalty, path_length_lengths,
+    save_image_grid,
 )
 
-def save_checkpoint(*, epoch, G, D_global, D_roi, g_optimizer, d_global_optimizer, d_roi_optimizer, out_path,
-                    g_scheduler=None, d_global_scheduler=None, d_roi_scheduler=None,
-                    fixed_noise=None, fixed_text=None, fixed_bboxes=None,
-                    G_ema=None, augment_pipe=None):
-    out_dir = os.path.dirname(out_path) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    payload = {
-        "epoch": int(epoch),
-        "config": {k: getattr(config, k) for k in dir(config) if k.isupper()},
+
+# ---------------------------------------------------------------------------
+# Checkpoint I/O
+# ---------------------------------------------------------------------------
+def _config_snapshot() -> dict:
+    return {k: getattr(config, k) for k in dir(config) if k.isupper()}
+
+
+def save_checkpoint(path, *, step, G, D, G_ema, g_opt, d_opt, scaler,
+                    pl_ema, fixed_z):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save({
+        "step": int(step),
+        "config": _config_snapshot(),
         "G": G.state_dict(),
-        "D_global": D_global.state_dict(),
-        "D_roi": D_roi.state_dict(),
-        "g_optimizer": g_optimizer.state_dict(),
-        "d_global_optimizer": d_global_optimizer.state_dict(),
-        "d_roi_optimizer": d_roi_optimizer.state_dict(),
-    }
-    if g_scheduler is not None:
-        payload["g_scheduler"] = g_scheduler.state_dict()
-    if d_global_scheduler is not None:
-        payload["d_global_scheduler"] = d_global_scheduler.state_dict()
-    if d_roi_scheduler is not None:
-        payload["d_roi_scheduler"] = d_roi_scheduler.state_dict()
-    if fixed_noise is not None:
-        payload["fixed_noise"] = fixed_noise.cpu()
-    if fixed_text is not None:
-        payload["fixed_text"] = fixed_text.cpu()
-    if fixed_bboxes is not None:
-        payload["fixed_bboxes"] = fixed_bboxes.cpu()
-    if G_ema is not None:
-        payload["G_ema"] = G_ema.state_dict()
-    if augment_pipe is not None:
-        payload["augment_pipe_p"] = augment_pipe.p.item()
-    torch.save(payload, out_path)
+        "D": D.state_dict(),
+        "G_ema": G_ema.state_dict(),
+        "g_opt": g_opt.state_dict(),
+        "d_opt": d_opt.state_dict(),
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "pl_ema": float(pl_ema),
+        "fixed_z": fixed_z.detach().cpu(),
+    }, path)
 
-def load_checkpoint(*, ckpt_path, G, D_global, D_roi, g_optimizer, d_global_optimizer, d_roi_optimizer, device,
-                    g_scheduler=None, d_global_scheduler=None, d_roi_scheduler=None,
-                    G_ema=None, augment_pipe=None):
-    ckpt = torch.load(ckpt_path, map_location=device)
+
+def load_checkpoint(path, *, G, D, G_ema, g_opt, d_opt, scaler, device):
+    ckpt = torch.load(path, map_location=device)
     G.load_state_dict(ckpt["G"])
-    D_global.load_state_dict(ckpt["D_global"])
-    D_roi.load_state_dict(ckpt["D_roi"])
-    g_optimizer.load_state_dict(ckpt["g_optimizer"])
-    d_global_optimizer.load_state_dict(ckpt["d_global_optimizer"])
-    d_roi_optimizer.load_state_dict(ckpt["d_roi_optimizer"])
-    if g_scheduler is not None and "g_scheduler" in ckpt:
-        g_scheduler.load_state_dict(ckpt["g_scheduler"])
-    if d_global_scheduler is not None and "d_global_scheduler" in ckpt:
-        d_global_scheduler.load_state_dict(ckpt["d_global_scheduler"])
-    if d_roi_scheduler is not None and "d_roi_scheduler" in ckpt:
-        d_roi_scheduler.load_state_dict(ckpt["d_roi_scheduler"])
-    if G_ema is not None and "G_ema" in ckpt:
-        G_ema.load_state_dict(ckpt["G_ema"])
-    if augment_pipe is not None and "augment_pipe_p" in ckpt:
-        augment_pipe.p.fill_(ckpt["augment_pipe_p"])
-    start_epoch = int(ckpt.get("epoch", 0))
-    return start_epoch
+    D.load_state_dict(ckpt["D"])
+    G_ema.load_state_dict(ckpt["G_ema"])
+    g_opt.load_state_dict(ckpt["g_opt"])
+    d_opt.load_state_dict(ckpt["d_opt"])
+    if scaler is not None and ckpt.get("scaler") is not None:
+        scaler.load_state_dict(ckpt["scaler"])
+    return ckpt
 
 
-def build_clip_text_encoder(device):
-    if not bool(getattr(config, "USE_CLIP_TEXT", True)):
-        return None, None
-    try:
-        import open_clip
-    except ImportError as exc:
-        raise ImportError(
-            "USE_CLIP_TEXT=True requires open-clip-torch. "
-            "Install with: pip install -r requirements.txt"
-        ) from exc
-
-    model_name = getattr(config, "TRAIN_CLIP_MODEL_NAME", "ViT-B-32")
-    pretrained = getattr(config, "TRAIN_CLIP_PRETRAINED", "openai")
-    clip_model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained, device=device)
-    clip_model.eval()
-    for param in clip_model.parameters():
-        param.requires_grad_(False)
-    tokenizer = open_clip.get_tokenizer(model_name)
-    return clip_model, tokenizer
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+def _format_eta(seconds: float) -> str:
+    """Format a duration as Hh:MMm or MMm:SSs — short, monotonic, easy to scan."""
+    if seconds <= 0:
+        return "  -  "
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:>2d}h{m:02d}m"
+    return f"{m:>2d}m{s:02d}s"
 
 
-@torch.no_grad()
-def encode_text_prompts(prompts, clip_model, tokenizer, device):
-    if clip_model is None or tokenizer is None:
-        bsz = len(prompts)
-        return torch.zeros(bsz, config.EMBEDDING_SIZE, dtype=torch.float32, device=device)
-    tokens = tokenizer(list(prompts)).to(device)
-    text_embeddings = clip_model.encode_text(tokens).float()
-    if text_embeddings.shape[-1] != config.EMBEDDING_SIZE:
-        raise ValueError(
-            f"CLIP embedding dim ({text_embeddings.shape[-1]}) does not match "
-            f"config.EMBEDDING_SIZE ({config.EMBEDDING_SIZE})."
-        )
-    return text_embeddings
+# ---------------------------------------------------------------------------
+# Generator EMA
+# ---------------------------------------------------------------------------
+def update_ema(G_ema, G, beta):
+    with torch.no_grad():
+        for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+            p_ema.copy_(p.lerp(p_ema, beta))
+        for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+            b_ema.copy_(b)
 
 
-def train_step(real_imgs, text_embeddings, bboxes,
-               G, D_global, D_roi,
-               g_optimizer, d_global_optimizer, d_roi_optimizer,
-               lambda_roi, lambda_leak, use_background_leak=True,
-               lambda_r1=0.0, r1_interval=16, step=0,
-               lambda_pl=0.0, pl_interval=4, pl_ema_ref=None,
-               augment_pipe=None,
-               *, scaler=None, use_amp=False):
+# ---------------------------------------------------------------------------
+# Training step components
+# ---------------------------------------------------------------------------
+def d_step(real_imgs, *, G, D, d_opt, scaler, use_amp,
+           lambda_r1, r1_interval, step):
+    """One discriminator step: hinge-style logistic loss, with lazy R1 regulariser."""
+    z = torch.randn(real_imgs.size(0), config.NOISE_SIZE, device=real_imgs.device)
 
-    real_imgs = real_imgs.to(config.DEVICE, non_blocking=True)
-    text_embeddings = text_embeddings.to(config.DEVICE, non_blocking=True)
-    bboxes = bboxes.to(config.DEVICE, non_blocking=True)
+    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        with torch.no_grad():
+            fake_imgs = G(z)
+        real_logits = D(real_imgs)
+        fake_logits = D(fake_imgs)
+        d_loss = d_logistic_loss(real_logits, fake_logits)
 
-    B = real_imgs.size(0)
-    bbox_mask = bboxes_to_mask(bboxes, image_size=real_imgs.shape[-1], device=config.DEVICE)
-
-    amp_enabled = bool(use_amp and config.DEVICE.type == "cuda")
-    use_scaler = scaler is not None and amp_enabled
-
-    # 1) Train Global Discriminator
-    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-        z = torch.randn(B, config.NOISE_SIZE, device=config.DEVICE)
-        fake_imgs = G(z, text_embeddings, bbox_mask).detach()
-
-        # ADA: augment real and fake before D — prevents D overfitting to raw pixel stats.
-        # R1 penalty (below) uses the original real_imgs, not the augmented version.
-        if augment_pipe is not None:
-            real_imgs_d = augment_pipe(real_imgs)
-            fake_imgs_d = augment_pipe(fake_imgs)
-        else:
-            real_imgs_d, fake_imgs_d = real_imgs, fake_imgs
-
-        real_logits_global = D_global(real_imgs_d, bbox_mask, text_embeddings)
-        fake_logits_global = D_global(fake_imgs_d, bbox_mask, text_embeddings)
-        d_global_loss = d_hinge_loss(real_logits_global, fake_logits_global)
-
-    d_global_optimizer.zero_grad(set_to_none=True)
-    if use_scaler:
-        scaler.scale(d_global_loss).backward()
-        scaler.step(d_global_optimizer)
+    d_opt.zero_grad(set_to_none=True)
+    if scaler is not None:
+        scaler.scale(d_loss).backward()
+        scaler.step(d_opt)
     else:
-        d_global_loss.backward()
-        d_global_optimizer.step()
+        d_loss.backward()
+        d_opt.step()
 
-    # R1 gradient penalty for D_global (lazy: every r1_interval steps)
-    # Computed in float32 with a separate forward pass — avoids fp16 precision issues
-    # with second-order gradients. Scaled by r1_interval so effective weight stays LAMBDA_R1.
+    r1_val = 0.0
     if lambda_r1 > 0 and (step % r1_interval == 0):
-        real_imgs_r1 = real_imgs.detach().float().requires_grad_(True)
-        real_logits_r1 = D_global(real_imgs_r1, bbox_mask.float(),
-                                  text_embeddings.float())
-        r1_pen_global = r1_gradient_penalty(real_imgs_r1, real_logits_r1)
-        # Multiply by r1_interval: lazy regularization computes every N steps,
-        # so we scale up to maintain the same effective weight as every-step reg.
-        r1_loss_global = (lambda_r1 * r1_interval / 2.0) * r1_pen_global
-        d_global_optimizer.zero_grad(set_to_none=True)
-        r1_loss_global.backward()
-        d_global_optimizer.step()
-    else:
-        r1_pen_global = torch.zeros(1)
+        # R1 in fp32 with a fresh forward — second-order grads are precision-sensitive
+        real_r1 = real_imgs.detach().float().requires_grad_(True)
+        real_logits_r1 = D(real_r1)
+        r1 = r1_gradient_penalty(real_r1, real_logits_r1)
+        r1_loss = (lambda_r1 * r1_interval / 2.0) * r1
+        d_opt.zero_grad(set_to_none=True)
+        r1_loss.backward()
+        d_opt.step()
+        r1_val = float(r1.detach().item())
 
-    # 2) Train ROI Discriminator
-    # Crop from augmented images so D_roi and D_global see consistent inputs.
-    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-        real_roi = crop_roi_from_bboxes(real_imgs_d, bboxes, out_size=config.ROI_SIZE)
-        fake_roi = crop_roi_from_bboxes(fake_imgs_d, bboxes, out_size=config.ROI_SIZE)
+    return {
+        "d_loss": float(d_loss.detach().item()),
+        "real_logit": float(real_logits.detach().mean().item()),
+        "fake_logit": float(fake_logits.detach().mean().item()),
+        "r1": r1_val,
+    }
 
-        real_logits_roi = D_roi(real_roi)
-        fake_logits_roi = D_roi(fake_roi)
-        d_roi_loss = d_hinge_loss(real_logits_roi, fake_logits_roi)
 
-    d_roi_optimizer.zero_grad(set_to_none=True)
-    if use_scaler:
-        scaler.scale(d_roi_loss).backward()
-        scaler.step(d_roi_optimizer)
-    else:
-        d_roi_loss.backward()
-        d_roi_optimizer.step()
+def g_step(*, G, D, g_opt, scaler, use_amp, batch_size, device,
+           lambda_pl, pl_interval, pl_ema_ref, step):
+    """One generator step: non-saturating logistic adv loss + lazy path-length penalty."""
+    z = torch.randn(batch_size, config.NOISE_SIZE, device=device)
+    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+        fake_imgs, _ = G(z, return_w=True)
+        fake_logits = D(fake_imgs)
+        g_loss = g_nonsaturating_loss(fake_logits)
 
-    # R1 gradient penalty for D_roi
-    if lambda_r1 > 0 and (step % r1_interval == 0):
-        real_roi_r1 = real_roi.detach().float().requires_grad_(True)
-        real_logits_roi_r1 = D_roi(real_roi_r1)
-        r1_pen_roi = r1_gradient_penalty(real_roi_r1, real_logits_roi_r1)
-        r1_loss_roi = (lambda_r1 * r1_interval / 2.0) * r1_pen_roi
-        d_roi_optimizer.zero_grad(set_to_none=True)
-        r1_loss_roi.backward()
-        d_roi_optimizer.step()
-
-    # 3) Train Generator
-    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
-        z = torch.randn(B, config.NOISE_SIZE, device=config.DEVICE)
-        fake_imgs = G(z, text_embeddings, bbox_mask)
-
-        # G must fool D even under augmentation — apply pipe to fakes here too.
-        # Augmentation ops are differentiable so gradients still flow back to G.
-        fake_imgs_g = augment_pipe(fake_imgs) if augment_pipe is not None else fake_imgs
-
-        fake_logits_global = D_global(fake_imgs_g, bbox_mask, text_embeddings)
-        fake_roi = crop_roi_from_bboxes(fake_imgs_g, bboxes, out_size=config.ROI_SIZE)
-        fake_logits_roi = D_roi(fake_roi)
-
-        g_adv_global = g_hinge_loss(fake_logits_global)
-        g_adv_roi = g_hinge_loss(fake_logits_roi)
-
-        if use_background_leak:
-            g_leak = leakage_loss_background(fake_imgs, real_imgs, bbox_mask)
-        else:
-            g_leak = leakage_loss_simple(fake_imgs, bbox_mask)
-
-        g_loss = g_adv_global + lambda_roi * g_adv_roi + lambda_leak * g_leak
-
-    g_optimizer.zero_grad(set_to_none=True)
-    if use_scaler:
+    g_opt.zero_grad(set_to_none=True)
+    if scaler is not None:
         scaler.scale(g_loss).backward()
-        scaler.unscale_(g_optimizer)
-        torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-        scaler.step(g_optimizer)
+        scaler.step(g_opt)
         scaler.update()
     else:
         g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=1.0)
-        g_optimizer.step()
+        g_opt.step()
 
-    # --- StyleGAN2 Path Length Regularization (lazy: every pl_interval steps) ---
-    # Penalises changes in path length relative to a running EMA, encouraging
-    # a fixed step in latent space to produce a fixed-magnitude pixel change.
-    pl_pen_val = 0.0
-    if lambda_pl > 0 and pl_ema_ref is not None and (step % pl_interval == 0):
-        z_pl = torch.randn(B, config.NOISE_SIZE, device=config.DEVICE,
-                           requires_grad=True)
-        fake_pl = G(z_pl, text_embeddings, bbox_mask)
-        pl_lengths = path_length_penalty(fake_pl, z_pl)   # [B]
-        pl_mean = pl_lengths.mean().detach()
-
-        # Warm-start EMA on first call, then exponential decay
+    pl_val = 0.0
+    if lambda_pl > 0 and (step % pl_interval == 0):
+        # Path length in fp32 — uses second-order autograd
+        z_pl = torch.randn(max(batch_size // 2, 1), config.NOISE_SIZE, device=device)
+        w_pl = G.mapping(z_pl).float().requires_grad_(True)
+        # Re-run the synthesis manually with w_pl so autograd.grad can target it
+        x = G.const.expand(z_pl.size(0), -1, -1, -1).float()
+        rgb = None
+        for block in G.blocks:
+            x, rgb = block(x.float(), w_pl, skip_rgb=rgb)
+        fake_pl = torch.tanh(rgb)
+        lengths = path_length_lengths(fake_pl, w_pl)
+        mean_len = lengths.mean().detach()
         if pl_ema_ref[0] == 0.0:
-            pl_ema_ref[0] = pl_mean.item()
+            pl_ema_ref[0] = float(mean_len.item())
         else:
-            pl_ema_ref[0] = 0.99 * pl_ema_ref[0] + 0.01 * pl_mean.item()
-
-        pl_penalty = (pl_lengths - pl_ema_ref[0]).pow(2).mean()
-        # Same lazy-reg scaling as R1: multiply by interval to maintain
-        # the same effective weight as if computed every step.
-        pl_loss = lambda_pl * pl_interval * pl_penalty
-
-        g_optimizer.zero_grad(set_to_none=True)
+            pl_ema_ref[0] = 0.99 * pl_ema_ref[0] + 0.01 * float(mean_len.item())
+        pl_pen = (lengths - pl_ema_ref[0]).pow(2).mean()
+        pl_loss = lambda_pl * pl_interval * pl_pen
+        g_opt.zero_grad(set_to_none=True)
         pl_loss.backward()
-        g_optimizer.step()
-        pl_pen_val = float(pl_penalty.item())
+        g_opt.step()
+        pl_val = float(pl_pen.detach().item())
 
-    return {
-        "d_global_loss": float(d_global_loss.item()),
-        "d_roi_loss": float(d_roi_loss.item()),
-        "g_loss": float(g_loss.item()),
-        "r1_penalty": float(r1_pen_global.item()),
-        "pl_penalty": pl_pen_val,
-        # ADA overfitting signal: mean(sign(D(real))).  Ranges in [-1, 1].
-        # Values near +1 mean D is very confident on reals → augment more.
-        "real_sign": float(real_logits_global.detach().sign().mean().item()),
-    }
+    return {"g_loss": float(g_loss.detach().item()), "pl": pl_val}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Train small-scale StyleGAN2 on FFHQ")
+    p.add_argument("--resume", action="store_true",
+                   help=f"Resume from {os.path.join(config.CKPT_DIR, 'latest.pth')} if present")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Start fresh even if a checkpoint exists")
+    p.add_argument("--total-steps", type=int, default=None,
+                   help="Override config.TOTAL_STEPS")
+    return p.parse_args()
+
 
 def main():
-    print(f"Using device: {config.DEVICE}")
-    if config.DEVICE.type == "cuda":
+    args = parse_args()
+    device = config.DEVICE
+    print(f"Device: {device}")
+    if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    else:
-        print("CUDA is unavailable in this environment; training runs on CPU.")
-    clip_model, clip_tokenizer = build_clip_text_encoder(config.DEVICE)
 
-    # Pre-compute all CLIP embeddings once (cached to disk after first run).
-    # This eliminates per-batch CLIP inference in the training loop.
-    clip_embeddings = None
-    if clip_model is not None:
-        dataset_name = getattr(config, "DATASET", "celeba").lower()
-        if dataset_name == "ffhq":
-            # FFHQ has no per-image attribute labels; use one shared prompt for all entries.
-            import json
-            with open(config.FFHQ_JSON_FILE) as _f:
-                _n = len(json.load(_f))
-            _default = getattr(config, "DEFAULT_PROMPT", "a high-quality portrait photo of a person")
-            clip_embeddings = precompute_clip_embeddings(
-                clip_model=clip_model,
-                tokenizer=clip_tokenizer,
-                device=config.DEVICE,
-                embedding_size=config.EMBEDDING_SIZE,
-                prompts=[_default] * _n,
-            )
-        else:
-            clip_embeddings = precompute_clip_embeddings(
-                clip_model=clip_model,
-                tokenizer=clip_tokenizer,
-                device=config.DEVICE,
-                embedding_size=config.EMBEDDING_SIZE,
-                attr_file=getattr(config, "ATTR_FILE", None),
-                bbox_file=config.BBOX_FILE,
-            )
+    use_amp = bool(config.USE_AMP) and device.type == "cuda"
+    total_steps = int(args.total_steps if args.total_steps else config.TOTAL_STEPS)
+    accum = max(1, int(getattr(config, "GRAD_ACCUM_STEPS", 1)))
 
-    dataloader = get_dataloader(return_prompt=True, clip_embeddings=clip_embeddings)
+    # ------------------------------------------------------------------
+    # Data
+    # ------------------------------------------------------------------
+    loader = get_dataloader()
+    data_iter = infinite_loader(loader)
 
-    # Init Models
-    G = GeneratorWithMask(
-        noise_size=config.NOISE_SIZE, feature_size=config.FEATURE_SIZE, 
-        num_channels=config.NUM_CHANNELS, embedding_size=config.EMBEDDING_SIZE, 
-        reduced_dim_size=config.REDUCED_DIM_SIZE
-    ).to(config.DEVICE)
+    # ------------------------------------------------------------------
+    # Models
+    # ------------------------------------------------------------------
+    G = Generator(
+        z_dim=config.NOISE_SIZE, w_dim=config.W_DIM,
+        img_resolution=config.IMAGE_SIZE, img_channels=config.NUM_CHANNELS,
+        channel_base=config.CHANNEL_BASE, channel_max=config.CHANNEL_MAX,
+        mapping_layers=config.MAPPING_LAYERS,
+    ).to(device)
+    D = Discriminator(
+        img_resolution=config.IMAGE_SIZE, img_channels=config.NUM_CHANNELS,
+        channel_base=config.CHANNEL_BASE, channel_max=config.CHANNEL_MAX,
+    ).to(device)
+    G_ema = copy.deepcopy(G).eval()
+    for p in G_ema.parameters():
+        p.requires_grad_(False)
 
-    # D_TEXT_DIM=0 disables projection conditioning — the inner product term
-    # amplifies R1 gradients ~500× at init causing immediate NaN. Re-enable
-    # only after confirming stable training.
-    d_text_dim = getattr(config, "D_TEXT_DIM", 0)
-    D_global = GlobalDiscriminator(
-        num_channels=config.NUM_CHANNELS, text_dim=d_text_dim
-    ).to(config.DEVICE)
-    D_roi = RoIDiscriminator(num_channels=config.NUM_CHANNELS).to(config.DEVICE)
+    n_params = sum(p.numel() for p in G.parameters()) + sum(p.numel() for p in D.parameters())
+    print(f"Models: G={sum(p.numel() for p in G.parameters())/1e6:.1f}M  "
+          f"D={sum(p.numel() for p in D.parameters())/1e6:.1f}M  "
+          f"total={n_params/1e6:.1f}M")
 
-    # EMA copy of G — updated every step, used for all visualisation and eval.
-    # Produces visibly smoother outputs than the live training weights.
-    G_ema = copy.deepcopy(G).eval().to(config.DEVICE)
+    # StyleGAN2 lazy-regularization LR scaling: regular optimizer LR is
+    # multiplied by interval/(interval+1) when applying lazy reg every N steps.
+    # Skipped here — we instead bake the interval into the loss weight.
+    g_opt = optim.Adam(G.parameters(), lr=config.LR_G, betas=config.BETAS)
+    d_opt = optim.Adam(D.parameters(), lr=config.LR_D, betas=config.BETAS)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
 
-    # ADA augmentation pipe — p starts at 0 (no augmentation) and is adapted
-    # automatically based on discriminator overfitting.
-    augment_pipe = AugmentPipe(
-        brightness=1.0, brightness_std=0.2,
-        contrast=1.0,   contrast_range=(0.5, 2.0),
-        cutout=0.5,     cutout_fraction=0.5,
-    ).to(config.DEVICE)
-
-    # Init Optimizers
-    lr_d = getattr(config, "LR_D", config.LR)
-    g_optimizer = optim.Adam(G.parameters(), lr=config.LR, betas=config.BETAS)
-    d_global_optimizer = optim.Adam(D_global.parameters(), lr=lr_d, betas=config.BETAS)
-    d_roi_optimizer = optim.Adam(D_roi.parameters(), lr=lr_d, betas=config.BETAS)
-
-    # LR schedulers: linear decay from LR_DECAY_START epoch → 0 at NUM_EPOCHS
-    lr_decay_start = getattr(config, "LR_DECAY_START", 150)
-    def lr_lambda(epoch):
-        if epoch < lr_decay_start:
-            return 1.0
-        return max(0.0, 1.0 - (epoch - lr_decay_start) / max(config.NUM_EPOCHS - lr_decay_start, 1))
-    g_scheduler = optim.lr_scheduler.LambdaLR(g_optimizer, lr_lambda)
-    d_global_scheduler = optim.lr_scheduler.LambdaLR(d_global_optimizer, lr_lambda)
-    d_roi_scheduler = optim.lr_scheduler.LambdaLR(d_roi_optimizer, lr_lambda)
-
-    ckpt_path = os.path.join("outputs", "checkpoints", "latest.pth")
-    start_epoch = 0  # epoch index to start from (0-based)
-    if os.path.exists(ckpt_path):
-        try:
-            # ckpt stores the last completed epoch number (1-based); next epoch index is that number
-            start_epoch = load_checkpoint(
-                ckpt_path=ckpt_path,
-                G=G,
-                D_global=D_global,
-                D_roi=D_roi,
-                g_optimizer=g_optimizer,
-                d_global_optimizer=d_global_optimizer,
-                d_roi_optimizer=d_roi_optimizer,
-                g_scheduler=g_scheduler,
-                d_global_scheduler=d_global_scheduler,
-                d_roi_scheduler=d_roi_scheduler,
-                device=config.DEVICE,
-                G_ema=G_ema,
-                augment_pipe=augment_pipe,
-            )
-            if start_epoch >= config.NUM_EPOCHS:
-                print(
-                    f"Checkpoint epoch ({start_epoch}) is already >= NUM_EPOCHS ({config.NUM_EPOCHS}). "
-                    "No additional epochs to train."
-                )
-                return
-            print(f"Resuming from checkpoint `{ckpt_path}` at epoch {start_epoch + 1}/{config.NUM_EPOCHS}...")
-            # Fast-forward schedulers if checkpoint didn't have them saved
-            if "g_scheduler" not in torch.load(ckpt_path, map_location="cpu"):
-                for _ in range(start_epoch):
-                    g_scheduler.step()
-                    d_global_scheduler.step()
-                    d_roi_scheduler.step()
-        except Exception as e:
-            print(f"Warning: failed to load checkpoint at `{ckpt_path}`. Starting fresh. Error: {e}")
-            start_epoch = 0
-
-    # Setup Fixed Noise for consistent eval tracking
-    fixed_noise = torch.randn(16, config.NOISE_SIZE, device=config.DEVICE)
-    fixed_prompts = [getattr(config, "DEFAULT_PROMPT", "a portrait photo of a person")] * 16
-    fixed_text = encode_text_prompts(fixed_prompts, clip_model, clip_tokenizer, config.DEVICE)
-    fixed_bboxes = torch.tensor([[0.30, 0.20, 0.70, 0.80]] * 16, dtype=torch.float32, device=config.DEVICE)
-    fixed_mask = bboxes_to_mask(fixed_bboxes, image_size=config.IMAGE_SIZE, device=config.DEVICE)
-
-    use_amp = bool(getattr(config, "USE_AMP", False)) and config.DEVICE.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    # Path length EMA state — a single float tracked across all batches
+    # Fixed-noise grid for visual progress tracking
+    fixed_z = torch.randn(int(config.NUM_SAMPLE_IMAGES), config.NOISE_SIZE, device=device)
     pl_ema_ref = [0.0]
 
-    # Create outputs directory and initialize results file
-    os.makedirs(os.path.dirname(config.RESULT_FILE), exist_ok=True)
-    if start_epoch == 0 or not os.path.exists(config.RESULT_FILE):
+    # ------------------------------------------------------------------
+    # Resume
+    # ------------------------------------------------------------------
+    os.makedirs(config.CKPT_DIR, exist_ok=True)
+    os.makedirs(config.SAMPLES_DIR, exist_ok=True)
+    ckpt_path = os.path.join(config.CKPT_DIR, "latest.pth")
+
+    start_step = 0
+    if args.no_resume:
+        pass
+    elif (args.resume or os.path.exists(ckpt_path)) and os.path.exists(ckpt_path):
+        try:
+            ckpt = load_checkpoint(ckpt_path, G=G, D=D, G_ema=G_ema,
+                                   g_opt=g_opt, d_opt=d_opt, scaler=scaler,
+                                   device=device)
+            start_step = int(ckpt.get("step", 0))
+            pl_ema_ref[0] = float(ckpt.get("pl_ema", 0.0))
+            if "fixed_z" in ckpt:
+                fz = ckpt["fixed_z"].to(device)
+                if fz.shape == fixed_z.shape:
+                    fixed_z = fz
+            print(f"Resumed from {ckpt_path} at step {start_step}")
+        except Exception as exc:
+            print(f"WARN: could not load checkpoint ({exc}); starting fresh")
+            start_step = 0
+
+    if start_step >= total_steps:
+        print(f"start_step ({start_step}) >= TOTAL_STEPS ({total_steps}). Nothing to do.")
+        return
+
+    # ------------------------------------------------------------------
+    # Training-log CSV
+    # ------------------------------------------------------------------
+    if start_step == 0 or not os.path.exists(config.RESULT_FILE):
+        os.makedirs(os.path.dirname(config.RESULT_FILE) or ".", exist_ok=True)
         with open(config.RESULT_FILE, "w") as f:
-            f.write("Epoch,D_global_loss,D_roi_loss,G_loss,Time_s\n")
+            f.write("step,d_loss,g_loss,r1,pl,real_logit,fake_logit,"
+                    "sec_per_step,img_per_sec,gpu_mem_gb,gpu_peak_gb,eta_sec\n")
 
-    print("Starting Training Loop...")
-    for epoch in range(start_epoch, config.NUM_EPOCHS):
-        # --- NEW: Record the start time of the epoch ---
-        epoch_start_time = time.time()
-        
-        G.train()
-        D_global.train()
-        D_roi.train()
+    # EMA decay derived from EMA_KIMG and (effective) batch size
+    eff_batch = config.BATCH_SIZE * accum
+    ema_beta = 0.5 ** (eff_batch / max(config.EMA_KIMG * 1000, 1e-8))
+    print(f"Training: total_steps={total_steps}  batch={config.BATCH_SIZE}x{accum}  "
+          f"AMP={use_amp}  ema_beta={ema_beta:.4f}")
 
-        epoch_stats = {"d_global": 0, "d_roi": 0, "g_loss": 0}
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS}")
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    G.train()
+    D.train()
 
-        # Gradual ROI warm-up: linear ramp from ROI_WARMUP_START → ROI_WARMUP_END
-        roi_warmup_start = getattr(config, "ROI_WARMUP_START", 10)
-        roi_warmup_end = getattr(config, "ROI_WARMUP_END", 30)
-        if epoch < roi_warmup_start:
-            current_lambda_roi = 0.0
-        elif epoch < roi_warmup_end:
-            current_lambda_roi = config.LAMBDA_ROI * (epoch - roi_warmup_start) / (roi_warmup_end - roi_warmup_start)
-        else:
-            current_lambda_roi = config.LAMBDA_ROI
+    # Running averages for smoother console logging
+    ravg = {"d_loss": 0.0, "g_loss": 0.0, "r1": 0.0, "pl": 0.0,
+            "real_logit": 0.0, "fake_logit": 0.0, "n": 0}
 
-        lambda_r1 = getattr(config, "LAMBDA_R1", 0.0)
-        r1_interval = getattr(config, "R1_INTERVAL", 16)
-        use_background_leak = getattr(config, "USE_BACKGROUND_LEAK", False)
-        lambda_pl = getattr(config, "LAMBDA_PL", 2.0)
-        pl_interval = getattr(config, "PL_INTERVAL", 4)
-        ada_target   = getattr(config, "ADA_TARGET",   0.6)
-        ada_interval = getattr(config, "ADA_INTERVAL", 4)
-        ada_kimg     = getattr(config, "ADA_KIMG",     500.0)
-        ema_kimg     = getattr(config, "EMA_KIMG",     10.0)
-        ema_nimg     = ema_kimg * 1000
-        ema_beta     = 0.5 ** (config.BATCH_SIZE / max(ema_nimg, 1e-8))
-
-        # Accumulator for ADA overfitting signal
-        ada_sign_acc   = 0.0
-        ada_sign_count = 0
-
-        for i, (real_imgs, text_prompts, bboxes) in enumerate(progress_bar):
-            global_step = epoch * len(dataloader) + i
-            # If the dataset returned pre-computed tensors, move them to device directly.
-            # Otherwise fall back to on-the-fly CLIP encoding (slower).
-            if isinstance(text_prompts, torch.Tensor):
-                text_embeddings = text_prompts.to(config.DEVICE, non_blocking=True)
-            else:
-                text_embeddings = encode_text_prompts(text_prompts, clip_model, clip_tokenizer, config.DEVICE)
-
-            stats = train_step(
-                real_imgs, text_embeddings, bboxes,
-                G, D_global, D_roi,
-                g_optimizer, d_global_optimizer, d_roi_optimizer,
-                lambda_roi=current_lambda_roi, lambda_leak=config.LAMBDA_LEAK,
-                use_background_leak=use_background_leak,
-                lambda_r1=lambda_r1, r1_interval=r1_interval, step=global_step,
-                lambda_pl=lambda_pl, pl_interval=pl_interval, pl_ema_ref=pl_ema_ref,
-                augment_pipe=augment_pipe,
-                scaler=scaler, use_amp=use_amp,
+    last_t = time.time()
+    for step in range(start_step + 1, total_steps + 1):
+        # ---- Discriminator (with optional grad accumulation) ----
+        d_stats_acc = {"d_loss": 0.0, "real_logit": 0.0, "fake_logit": 0.0, "r1": 0.0}
+        for _ in range(accum):
+            real_imgs = next(data_iter).to(device, non_blocking=True)
+            stats = d_step(
+                real_imgs, G=G, D=D, d_opt=d_opt, scaler=scaler,
+                use_amp=use_amp, lambda_r1=config.LAMBDA_R1,
+                r1_interval=config.R1_INTERVAL, step=step,
             )
+            for k, v in stats.items():
+                d_stats_acc[k] += v / accum
 
-            # --- EMA update (every step) ---
-            with torch.no_grad():
-                for p_ema, p in zip(G_ema.parameters(), G.parameters()):
-                    p_ema.copy_(p.lerp(p_ema, ema_beta))
-                for b_ema, b in zip(G_ema.buffers(), G.buffers()):
-                    b_ema.copy_(b)
+        # ---- Generator ----
+        g_stats_acc = {"g_loss": 0.0, "pl": 0.0}
+        for _ in range(accum):
+            stats = g_step(
+                G=G, D=D, g_opt=g_opt, scaler=scaler, use_amp=use_amp,
+                batch_size=config.BATCH_SIZE, device=device,
+                lambda_pl=config.LAMBDA_PL, pl_interval=config.PL_INTERVAL,
+                pl_ema_ref=pl_ema_ref, step=step,
+            )
+            for k, v in stats.items():
+                g_stats_acc[k] += v / accum
 
-            # --- ADA p update (every ada_interval steps) ---
-            ada_sign_acc   += stats["real_sign"]
-            ada_sign_count += 1
-            if (global_step + 1) % ada_interval == 0:
-                augment_pipe.update_p(
-                    real_sign_mean=ada_sign_acc / ada_sign_count,
-                    batch_size=config.BATCH_SIZE,
-                    interval=ada_interval,
-                    ada_kimg=ada_kimg,
-                    ada_target=ada_target,
+        # ---- EMA ----
+        update_ema(G_ema, G, ema_beta)
+
+        # ---- Logging ----
+        for k, v in d_stats_acc.items():
+            ravg[k] += v
+        for k, v in g_stats_acc.items():
+            ravg[k] += v
+        ravg["n"] += 1
+
+        if step % config.LOG_EVERY == 0 or step == start_step + 1:
+            n = max(ravg["n"], 1)
+            now = time.time()
+            # First log line of a run has no prior interval to time against
+            first_line = (step == start_step + 1)
+            interval_steps = 1 if first_line else config.LOG_EVERY
+            sec = 0.0 if first_line else (now - last_t) / max(interval_steps, 1)
+            last_t = now
+
+            img_per_sec = (config.BATCH_SIZE * accum / sec) if sec > 0 else 0.0
+            remaining = max(0, total_steps - step)
+            eta_sec = remaining * sec if sec > 0 else 0.0
+            eta_str = _format_eta(eta_sec)
+
+            if device.type == "cuda":
+                gpu_mem_gb  = torch.cuda.memory_allocated(device)     / (1024 ** 3)
+                gpu_peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                gpu_str = f"mem={gpu_mem_gb:4.1f}/peak={gpu_peak_gb:4.1f}GB  "
+                # Reset peak so each window's peak is meaningful
+                torch.cuda.reset_peak_memory_stats(device)
+            else:
+                gpu_mem_gb = gpu_peak_gb = 0.0
+                gpu_str = ""
+
+            print(
+                f"[{step:>7d}/{total_steps}] "
+                f"D={ravg['d_loss']/n:.3f}  G={ravg['g_loss']/n:.3f}  "
+                f"R1={ravg['r1']/n:.3f}  PL={ravg['pl']/n:.3f}  "
+                f"D(real)={ravg['real_logit']/n:+.2f}  D(fake)={ravg['fake_logit']/n:+.2f}  "
+                f"sec/it={sec:.3f}  img/s={img_per_sec:5.1f}  "
+                f"{gpu_str}eta={eta_str}",
+                flush=True,
+            )
+            with open(config.RESULT_FILE, "a") as f:
+                f.write(
+                    f"{step},{ravg['d_loss']/n:.4f},{ravg['g_loss']/n:.4f},"
+                    f"{ravg['r1']/n:.4f},{ravg['pl']/n:.4f},"
+                    f"{ravg['real_logit']/n:.4f},{ravg['fake_logit']/n:.4f},"
+                    f"{sec:.4f},{img_per_sec:.2f},"
+                    f"{gpu_mem_gb:.3f},{gpu_peak_gb:.3f},{eta_sec:.1f}\n"
                 )
-                ada_sign_acc   = 0.0
-                ada_sign_count = 0
+                f.flush()
+            for k in ravg:
+                ravg[k] = 0 if k == "n" else 0.0
 
-            epoch_stats["d_global"] += stats["d_global_loss"]
-            epoch_stats["d_roi"] += stats["d_roi_loss"]
-            epoch_stats["g_loss"] += stats["g_loss"]
+        # ---- Sample grid ----
+        if step % config.SAMPLE_EVERY == 0:
+            G_ema.eval()
+            with torch.no_grad():
+                imgs = G_ema(fixed_z)
+            nrow = max(1, int(round(math.sqrt(fixed_z.size(0)))))
+            save_image_grid(imgs, os.path.join(config.SAMPLES_DIR,
+                                               f"step_{step:07d}.png"),
+                            nrow=nrow)
+            G_ema.train()  # safe (no BN/Dropout); keeps semantics consistent
 
-            progress_bar.set_postfix({
-                "Dg": f"{stats['d_global_loss']:.3f}",
-                "Dr": f"{stats['d_roi_loss']:.3f}",
-                "G": f"{stats['g_loss']:.3f}",
-                "R1": f"{stats['r1_penalty']:.3f}",
-                "PL": f"{stats['pl_penalty']:.3f}",
-                "p":  f"{augment_pipe.p.item():.3f}",
-            })
+        # ---- Checkpoint ----
+        if step % config.CHECKPOINT_EVERY == 0 or step == total_steps:
+            save_checkpoint(ckpt_path, step=step, G=G, D=D, G_ema=G_ema,
+                            g_opt=g_opt, d_opt=d_opt, scaler=scaler,
+                            pl_ema=pl_ema_ref[0], fixed_z=fixed_z)
+            # Also save a versioned copy of milestone checkpoints
+            milestone = os.path.join(config.CKPT_DIR, f"step_{step:07d}.pth")
+            save_checkpoint(milestone, step=step, G=G, D=D, G_ema=G_ema,
+                            g_opt=g_opt, d_opt=d_opt, scaler=scaler,
+                            pl_ema=pl_ema_ref[0], fixed_z=fixed_z)
+            print(f"Saved checkpoint -> {ckpt_path} (and {milestone})")
 
-        # --- NEW: Calculate total time taken for the epoch ---
-        epoch_duration = time.time() - epoch_start_time
+    # ------------------------------------------------------------------
+    # Final sample grid
+    # ------------------------------------------------------------------
+    G_ema.eval()
+    with torch.no_grad():
+        imgs = G_ema(fixed_z)
+    final_path = os.path.join(config.OUTPUT_DIR, "final_samples.png")
+    save_image_grid(imgs, final_path,
+                    nrow=max(1, int(round(math.sqrt(fixed_z.size(0))))))
+    print(f"Training complete. Final samples -> {final_path}")
 
-        num_batches = len(dataloader)
-        avg_dg = epoch_stats['d_global'] / num_batches
-        avg_dr = epoch_stats['d_roi'] / num_batches
-        avg_g = epoch_stats['g_loss'] / num_batches
-        
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  D_global: {avg_dg:.4f}")
-        print(f"  D_roi   : {avg_dr:.4f}")
-        print(f"  G_loss  : {avg_g:.4f}")
-        print(f"  LR_G    : {g_scheduler.get_last_lr()[0]:.2e}")
-        print(f"  ADA p   : {augment_pipe.p.item():.4f}")
-        print(f"  Time    : {epoch_duration:.2f} seconds")
-
-        with open(config.RESULT_FILE, "a") as f:
-            f.write(f"{epoch+1},{avg_dg:.4f},{avg_dr:.4f},{avg_g:.4f},{epoch_duration:.2f}\n")
-
-        # Visualise with G_ema — its averaged weights give cleaner samples than live G
-        with torch.no_grad():
-            fake_imgs = G_ema(fixed_noise, fixed_text, fixed_mask)
-
-        save_or_show_images(fake_imgs, title=f"Epoch {epoch+1} (EMA)", save_path=f"outputs/epoch_{epoch+1}.png")
-
-        # Step LR schedulers at end of each epoch
-        g_scheduler.step()
-        d_global_scheduler.step()
-        d_roi_scheduler.step()
-
-        # Save checkpoint after each epoch
-        save_checkpoint(
-            epoch=epoch + 1,
-            G=G,
-            D_global=D_global,
-            D_roi=D_roi,
-            g_optimizer=g_optimizer,
-            d_global_optimizer=d_global_optimizer,
-            d_roi_optimizer=d_roi_optimizer,
-            g_scheduler=g_scheduler,
-            d_global_scheduler=d_global_scheduler,
-            d_roi_scheduler=d_roi_scheduler,
-            out_path=os.path.join("outputs", "checkpoints", "latest.pth"),
-            G_ema=G_ema,
-            augment_pipe=augment_pipe,
-        )
 
 if __name__ == "__main__":
     main()

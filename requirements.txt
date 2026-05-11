@@ -1,11 +1,6 @@
-torch
+torch>=1.12
 torchvision
-torchmetrics
-torch-fidelity
-open-clip-torch
-kaggle
-pandas
-numpy
-matplotlib
 Pillow
-tqdm
+numpy
+# Optional — only needed if you want to compute FID externally
+# torch-fidelity

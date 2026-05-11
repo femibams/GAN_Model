@@ -1,124 +1,87 @@
+"""Loss and visualisation helpers used by train.py / infer.py."""
 import math
-import torch
-import torch.nn.functional as F
-import torchvision.utils as vutils
-import matplotlib.pyplot as plt
 import os
 
-# ------------------------------------------------------------
-# Bounding box & ROI utilities
-# ------------------------------------------------------------
-def bboxes_to_mask(bboxes, image_size=128, device=None):
-    if device is None:
-        device = bboxes.device
+import torch
+import torch.nn.functional as F
+from PIL import Image
 
-    B = bboxes.shape[0]
-    # Vectorized: build coordinate grids and compare against bbox coords
-    # No Python loops, no .item() calls — stays entirely on GPU
-    coords = torch.linspace(0, 1, image_size, device=device)
-    gy, gx = torch.meshgrid(coords, coords, indexing="ij")  # [H, W] each
-    # bboxes: [B, 4] with (x1, y1, x2, y2) normalized
-    x1 = bboxes[:, 0].view(B, 1, 1)
-    y1 = bboxes[:, 1].view(B, 1, 1)
-    x2 = bboxes[:, 2].view(B, 1, 1)
-    y2 = bboxes[:, 3].view(B, 1, 1)
-    mask = ((gx >= x1) & (gx < x2) & (gy >= y1) & (gy < y2)).float().unsqueeze(1)
-    return mask
 
-def crop_roi_from_bboxes(images, bboxes, out_size=64):
-    """Crop per-sample RoIs and resize to out_size using grid_sample (fully vectorized)."""
-    B, C, H, W = images.shape
-    # Convert normalized (x1,y1,x2,y2) → grid_sample sampling grid in [-1, 1]
-    x1 = bboxes[:, 0].clamp(0, 1)
-    y1 = bboxes[:, 1].clamp(0, 1)
-    x2 = bboxes[:, 2].clamp(0, 1)
-    y2 = bboxes[:, 3].clamp(0, 1)
+# ---------------------------------------------------------------------------
+# Adversarial losses (non-saturating logistic — StyleGAN2 default)
+# ---------------------------------------------------------------------------
+def d_logistic_loss(real_logits, fake_logits):
+    """E[softplus(-D(real))] + E[softplus(D(fake))]."""
+    return F.softplus(-real_logits).mean() + F.softplus(fake_logits).mean()
 
-    # Build a sampling grid for each sample: shape [B, out_size, out_size, 2]
-    ty = torch.linspace(0, 1, out_size, device=images.device, dtype=images.dtype)
-    tx = torch.linspace(0, 1, out_size, device=images.device, dtype=images.dtype)
-    gy, gx = torch.meshgrid(ty, tx, indexing="ij")       # [out_size, out_size]
 
-    # Map [0,1] grid coords to each bbox's [x1,x2] / [y1,y2] range
-    sample_x = x1.view(B, 1, 1) + gx.unsqueeze(0) * (x2 - x1).view(B, 1, 1)
-    sample_y = y1.view(B, 1, 1) + gy.unsqueeze(0) * (y2 - y1).view(B, 1, 1)
+def g_nonsaturating_loss(fake_logits):
+    """E[softplus(-D(fake))]."""
+    return F.softplus(-fake_logits).mean()
 
-    # grid_sample expects coordinates in [-1, 1]
-    grid = torch.stack([sample_x * 2 - 1, sample_y * 2 - 1], dim=-1)  # [B, S, S, 2]
-    return F.grid_sample(images, grid, mode="bilinear", align_corners=False, padding_mode="border")
 
-# ------------------------------------------------------------
-# Loss functions
-# ------------------------------------------------------------
-def d_hinge_loss(real_logits, fake_logits):
-    loss_real = torch.mean(F.relu(1.0 - real_logits))
-    loss_fake = torch.mean(F.relu(1.0 + fake_logits))
-    return loss_real + loss_fake
+# ---------------------------------------------------------------------------
+# R1 regularizer (Mescheder et al., 2018) for the discriminator
+# ---------------------------------------------------------------------------
+def r1_gradient_penalty(real_imgs, real_logits):
+    """E[||grad_x D(x)||^2] on real samples; computed with create_graph=True."""
+    grad = torch.autograd.grad(
+        outputs=real_logits.sum(),
+        inputs=real_imgs,
+        create_graph=True,
+    )[0]
+    return grad.pow(2).reshape(grad.size(0), -1).sum(dim=1).mean()
 
-def g_hinge_loss(fake_logits):
-    return -torch.mean(fake_logits)
 
-def leakage_loss_simple(fake_imgs, bbox_mask):
-    outside_mask = 1.0 - bbox_mask
-    return (fake_imgs.abs() * outside_mask).mean()
-
-def leakage_loss_background(fake_imgs, real_imgs, bbox_mask):
-    outside_mask = 1.0 - bbox_mask
-    return (torch.abs(fake_imgs - real_imgs) * outside_mask).mean()
-
-def path_length_penalty(fake_imgs, latents):
-    """StyleGAN2 path length regularization.
-
-    Encourages a fixed-size step in latent space to result in a fixed-magnitude
-    change in image space, making latent-space interpolation smooth and
-    consistent across the full generator.
-
-    The penalty is (||J^T y||_2 - a)^2 where:
-      - J is the Jacobian of generated pixels w.r.t. latents
-      - y is a random unit vector in pixel space (Monte Carlo estimator)
-      - a is a running mean of path lengths (updated by caller via EMA)
-
-    Returns:
-        path_lengths: per-sample L2 path lengths, shape [B].
-        Caller computes (path_lengths - ema_mean).pow(2).mean() and adds
-        it to the generator loss.
-
-    Note: `latents` must have requires_grad=True before calling G.forward().
-    """
+# ---------------------------------------------------------------------------
+# Path-length regularizer (Karras et al., 2020) for the generator
+# ---------------------------------------------------------------------------
+def path_length_lengths(fake_imgs, w):
+    """L2 norm of d(fake * y) / d w with y a random unit vector in pixel space."""
     noise = torch.randn_like(fake_imgs) / math.sqrt(
         fake_imgs.shape[2] * fake_imgs.shape[3]
     )
     grad = torch.autograd.grad(
         outputs=(fake_imgs * noise).sum(),
-        inputs=latents,
+        inputs=w,
         create_graph=True,
     )[0]
-    return grad.pow(2).sum(dim=1).sqrt()   # [B]
+    return grad.pow(2).sum(dim=1).sqrt()
 
 
-def r1_gradient_penalty(real_imgs, real_logits):
-    """R1 gradient penalty (Mescheder et al., 2018): E[||∇D(x)||²] where x ~ p_data.
-    Computed in float32 to avoid precision issues with second-order gradients."""
-    gradients = torch.autograd.grad(
-        outputs=real_logits.sum(),
-        inputs=real_imgs,
-        create_graph=True,
-    )[0]
-    return gradients.pow(2).reshape(gradients.shape[0], -1).sum(1).mean()
+# ---------------------------------------------------------------------------
+# Visualisation
+# ---------------------------------------------------------------------------
+def save_image_grid(tensor, save_path, nrow=4, padding=2, pad_value=0.0):
+    """Save a [-1, 1] RGB image batch as a tiled PNG grid.
 
-# ------------------------------------------------------------
-# Visualization
-# ------------------------------------------------------------
-def save_or_show_images(tensor, title="Generated Images", save_path=None):
-    grid = vutils.make_grid(tensor[:16], nrow=4, normalize=True, value_range=(-1, 1))
-    plt.figure(figsize=(6,6))
-    plt.imshow(grid.permute(1, 2, 0).cpu())
-    plt.title(title)
-    plt.axis("off")
-    
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path)
-        plt.close()
-    else:
-        plt.show()
+    Numpy-free implementation — torchvision's save_image goes through numpy
+    which can fail in environments with broken numpy installs.
+    """
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    assert tensor.dim() == 4, "expected NCHW tensor"
+    n, c, h, w = tensor.shape
+    assert c in (1, 3), "save_image_grid expects 1 or 3 channels"
+    ncol = max(1, int(nrow))
+    nrow_grid = (n + ncol - 1) // ncol
+
+    # Map [-1, 1] -> [0, 1]
+    img = tensor.detach().clamp(-1, 1).add(1).div(2).cpu()
+
+    grid_h = nrow_grid * h + (nrow_grid + 1) * padding
+    grid_w = ncol     * w + (ncol     + 1) * padding
+    grid = torch.full((c, grid_h, grid_w), float(pad_value))
+    for idx in range(n):
+        r, k = divmod(idx, ncol)
+        y0 = padding + r * (h + padding)
+        x0 = padding + k * (w + padding)
+        grid[:, y0:y0 + h, x0:x0 + w] = img[idx]
+
+    # Tensor [C, H, W] in [0, 1] -> uint8 -> PIL -> PNG, all without numpy
+    arr = grid.mul(255).add_(0.5).clamp_(0, 255).to(torch.uint8)
+    if c == 1:
+        arr = arr.expand(3, -1, -1)
+    arr = arr.permute(1, 2, 0).contiguous()      # [H, W, 3]
+    h_, w_, _ = arr.shape
+    pil = Image.frombytes("RGB", (w_, h_), bytes(arr.flatten().tolist()))
+    pil.save(save_path)

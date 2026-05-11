@@ -1,6 +1,21 @@
-# Data
+# Data & datasets
 data/
 outputs/
+ffhq-dataset/
+celeba/
+*.zip
+*.tar.gz
+*.tar
+*.h5
+*.hdf5
+*.lmdb
+
+# Credentials & secrets
+.kaggle/
+kaggle.json
+*.pem
+*.key
+secrets.json
 
 # Python
 __pycache__/
@@ -13,18 +28,26 @@ dist/
 build/
 .eggs/
 *.egg
+*.so
 
 # Virtual environments
 venv/
 env/
+ENV/
 .venv/
 .env
+.env.*
 
 # Jupyter
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
 # Logs & results
 *.log
+logs/
+runs/
+wandb/
+tensorboard/
 *.csv
 training_results.csv
 eval_results.csv
@@ -33,16 +56,30 @@ eval_results.csv
 *.pt
 *.pth
 *.ckpt
+*.onnx
+*.safetensors
+checkpoints/
 
-# Datasets & archives
-*.zip
-*.tar.gz
-*.h5
+# Generated artifacts
+*.pdf
+samples/
+generated/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# IDE
+# IDE / editors
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.cache/
+
+# Coverage / testing
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/
